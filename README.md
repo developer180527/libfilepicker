@@ -1,9 +1,9 @@
-# filepicker
+# libfilepicker
 
 Choosing a file to open, on every platform, behind one call:
 
 ```rust
-filepicker::pick(|picked| {
+libfilepicker::pick(|picked| {
     if let Some(file) = picked {
         open(file.path());
     }
