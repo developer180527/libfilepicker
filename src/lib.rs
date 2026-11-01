@@ -1,8 +1,8 @@
 //! Choosing a file to open, on every platform.
 //!
-//! [`pick`] hands its answer to a callback rather than returning it: phones show
-//! their document picker and answer later, from the main thread. Desktops answer
-//! before `pick` returns.
+//! [`pick`] and [`pick_with`] hand their answer to a callback rather than returning
+//! it: phones show their document picker and answer later, from the main thread.
+//! Desktops answer before the call returns.
 //!
 //! | Platform | Picker |
 //! |---|---|
@@ -36,11 +36,31 @@ impl Picked {
     }
 }
 
+/// What to ask the user for, and where to start looking.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PickOptions {
+    /// Let the user choose a folder. On iOS the picker then offers files and folders
+    /// both; desktop dialogs choose one or the other, so there it picks a folder.
+    pub folders: bool,
+    /// Open the picker in this folder (a model's folder, so granting it is one tap).
+    /// Ignored when it doesn't exist; the system's own default is used then.
+    pub start_in: Option<PathBuf>,
+}
+
 /// Asks the user for a file to open (on iOS, a file or a folder), and calls `done`
-/// with it, or with `None` if they cancelled (or this platform has no picker yet). Call from the main thread;
-/// `done` is called on it too, once the picker is off screen.
+/// with it, or with `None` if they cancelled (or this platform has no picker yet).
+/// Shorthand for [`pick_with`] with folders allowed on iOS only, where the picker
+/// can offer both at once.
 pub fn pick(done: impl FnOnce(Option<Picked>) + 'static) {
-    imp::pick(Box::new(done));
+    pick_with(PickOptions { folders: cfg!(target_os = "ios"), start_in: None }, done);
+}
+
+/// Asks the user for a file or folder as `opts` says, and calls `done` with it, or
+/// with `None` if they cancelled (or this platform has no picker yet). Call from the
+/// main thread; `done` is called on it too, once the picker is off screen. While a
+/// picker is already showing, another call answers `None` at once.
+pub fn pick_with(opts: PickOptions, done: impl FnOnce(Option<Picked>) + 'static) {
+    imp::pick(opts, Box::new(done));
 }
 
 type Done = Box<dyn FnOnce(Option<Picked>)>;
@@ -49,14 +69,20 @@ type Done = Box<dyn FnOnce(Option<Picked>)>;
 mod imp {
     use std::marker::PhantomData;
 
-    use super::{Done, Picked};
+    use super::{Done, PickOptions, Picked};
 
     /// Nothing to hold on desktops; not `Send`, to match iOS.
     #[derive(Debug)]
     pub struct Access(PhantomData<*const ()>);
 
-    pub fn pick(done: Done) {
-        done(rfd::FileDialog::new().pick_file().map(|path| Picked { path, _access: Access(PhantomData) }));
+    pub fn pick(opts: PickOptions, done: Done) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = opts.start_in.filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        // The dialog is modal and answers before it returns.
+        let path = if opts.folders { dialog.pick_folder() } else { dialog.pick_file() };
+        done(path.map(|path| Picked { path, _access: Access(PhantomData) }));
     }
 }
 
@@ -72,7 +98,7 @@ mod imp {
     use objc2::runtime::{AnyObject, NSObject};
     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send};
 
-    use super::{Done, Picked};
+    use super::{Done, PickOptions, Picked};
 
     #[link(name = "UIKit", kind = "framework")]
     unsafe extern "C" {}
@@ -134,14 +160,25 @@ mod imp {
             unsafe {
                 let coordinator: Option<Retained<AnyObject>> = msg_send![picker, transitionCoordinator];
                 let Some(coordinator) = coordinator else { return done(picked) };
-                let once = Cell::new(Some((done, picked)));
+                let once = std::rc::Rc::new(Cell::new(Some((done, picked))));
+                let pending = once.clone();
                 let completion = RcBlock::new(move |_context: *mut AnyObject| {
-                    if let Some((done, picked)) = once.take() {
+                    if let Some((done, picked)) = pending.take() {
                         done(picked);
                     }
                 });
-                let _: bool = msg_send![&coordinator, animateAlongsideTransition: std::ptr::null::<Block<dyn Fn(*mut AnyObject)>>(), completion: &*completion];
+                let queued: bool = msg_send![&coordinator, animateAlongsideTransition: std::ptr::null::<Block<dyn Fn(*mut AnyObject)>>(), completion: &*completion];
+                // NO means UIKit couldn't queue it and will never call the completion:
+                // answer now rather than lose the pick.
+                if !queued && let Some((done, picked)) = once.take() {
+                    done(picked);
+                }
             }
+        }
+
+        /// Still waiting for the user: its `done` hasn't been called.
+        fn waiting(&self) -> bool {
+            self.ivars().borrow().is_some()
         }
     }
 
@@ -195,8 +232,24 @@ mod imp {
         }
     }
 
-    pub fn pick(done: Done) {
+    /// `NSURL` for a folder, or `None` when it doesn't exist.
+    fn folder_url(dir: &std::path::Path) -> Option<Retained<AnyObject>> {
+        let dir = dir.is_dir().then(|| dir.to_str()).flatten()?;
+        let c = std::ffi::CString::new(dir).ok()?;
+        // SAFETY: Foundation's own constructors with a NUL-terminated UTF-8 string.
+        unsafe {
+            let s: Option<Retained<AnyObject>> = msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()];
+            msg_send![class!(NSURL), fileURLWithPath: &*s?, isDirectory: true]
+        }
+    }
+
+    pub fn pick(opts: PickOptions, done: Done) {
         let Some(mtm) = MainThreadMarker::new() else { return done(None) };
+        // One picker at a time: a second would be presented over the first, and the
+        // first's answer would have nowhere to go.
+        if DELEGATE.with(|d| d.borrow().as_ref().is_some_and(|d| d.waiting())) {
+            return done(None);
+        }
         let Some(presenter) = presenter(mtm) else { return done(None) };
         let delegate = Delegate::alloc(mtm).set_ivars(RefCell::new(Some(done)));
         // SAFETY: NSObject's init; then UIKit's own classes and selectors, on the
@@ -204,11 +257,15 @@ mod imp {
         // which is why `picked` takes security-scoped access.
         unsafe {
             let delegate: Retained<Delegate> = msg_send![super(delegate), init];
-            let types = [UTTypeItem, UTTypeFolder];
+            let all = [UTTypeItem, UTTypeFolder];
+            let types = if opts.folders { &all[..] } else { &all[..1] };
             let types: Retained<AnyObject> = msg_send![class!(NSArray), arrayWithObjects: types.as_ptr(), count: types.len()];
             let picker: Allocated<AnyObject> = msg_send![class!(UIDocumentPickerViewController), alloc];
             let picker: Retained<AnyObject> = msg_send![picker, initForOpeningContentTypes: &*types, asCopy: false];
             let () = msg_send![&picker, setDelegate: &*delegate];
+            if let Some(url) = opts.start_in.as_deref().and_then(folder_url) {
+                let () = msg_send![&picker, setDirectoryURL: &*url];
+            }
             let () = msg_send![&presenter, presentViewController: &*picker, animated: true, completion: std::ptr::null::<AnyObject>()];
             DELEGATE.with(|d| *d.borrow_mut() = Some(delegate));
         }
@@ -219,12 +276,12 @@ mod imp {
 mod imp {
     use std::marker::PhantomData;
 
-    use super::Done;
+    use super::{Done, PickOptions};
 
     #[derive(Debug)]
     pub struct Access(PhantomData<*const ()>);
 
-    pub fn pick(done: Done) {
+    pub fn pick(_: PickOptions, done: Done) {
         done(None);
     }
 }
