@@ -1,0 +1,10 @@
+[package]
+name = "filepicker"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+description = "Choosing a file to open, on every platform: native dialogs on desktops, the system document picker on phones."
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+rfd = "0.17"
